@@ -1,0 +1,51 @@
+pipeline {
+    agent any
+    environment {
+        IMAGE_NAME = 'yourdockerhubuser/your-java-app'
+    }
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out the code...'
+                checkout scm
+            }
+        }
+        stage('Build') {
+            steps {
+                echo 'Building the application...'
+                sh './build.sh'
+            }
+        }
+        stage('Test') {
+            steps {
+                echo 'Running tests...'
+                sh './test.sh'
+            }
+        }
+        stage('Package') {
+            steps {
+                echo 'Packaging the application...'
+                sh './package.sh'
+            }
+        }
+        stage('Docker Build & Push') {
+            steps {
+                script {
+                    docker.build("${IMAGE_NAME}")
+                          .push()
+                }
+            }
+        }
+    }
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            echo 'Pipeline succeeded!'
+        }
+        failure {
+            echo 'Pipeline failed!'
+        }
+    }
+}
