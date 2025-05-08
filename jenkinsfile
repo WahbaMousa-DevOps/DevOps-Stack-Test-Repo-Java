@@ -1,51 +1,173 @@
 pipeline {
-    agent any
-    environment {
-        IMAGE_NAME = 'yourdockerhubuser/your-java-app'
+    agent {
+        label 'java'
     }
+    
+    environment {
+        DOCKER_REGISTRY = 'docker.io'
+        DOCKER_REPOSITORY = 'yourusername/java-sample-app'
+        DOCKER_CREDENTIALS_ID = 'dockerhub-credentials'
+        APP_VERSION = "${env.BUILD_NUMBER}"
+        SONAR_PROJECT_KEY = 'java-sample-app'
+    }
+    
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        disableConcurrentBuilds()
+        timestamps()
+    }
+    
     stages {
         stage('Checkout') {
             steps {
-                echo 'Checking out the code...'
                 checkout scm
             }
         }
-        stage('Build') {
-            steps {
-                echo 'Building the application...'
-                sh './build.sh'
-            }
-        }
-        stage('Test') {
-            steps {
-                echo 'Running tests...'
-                sh './test.sh'
-            }
-        }
-        stage('Package') {
-            steps {
-                echo 'Packaging the application...'
-                sh './package.sh'
-            }
-        }
-        stage('Docker Build & Push') {
+        
+        stage('Set Build Variables') {
             steps {
                 script {
-                    docker.build("${IMAGE_NAME}")
-                          .push()
+                    // Extract git commit hash
+                    env.GIT_COMMIT_HASH = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    
+                    // Define docker image tags
+                    env.DOCKER_IMAGE_TAG = "${env.GIT_COMMIT_HASH}-${env.BUILD_NUMBER}"
+                    env.DOCKER_IMAGE_LATEST = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPOSITORY}:latest"
+                    env.DOCKER_IMAGE_VERSION = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPOSITORY}:${env.DOCKER_IMAGE_TAG}"
+                    
+                    // For Maven/Gradle versioning
+                    env.PROJECT_VERSION = sh(script: './gradlew properties -q | grep "version:" | awk \'{print $2}\'', returnStdout: true).trim()
+                }
+                echo "Building version: ${env.PROJECT_VERSION} (${env.DOCKER_IMAGE_TAG})"
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                sh './gradlew clean build -x test'
+            }
+        }
+        
+        stage('Test') {
+            steps {
+                sh './gradlew test'
+            }
+            post {
+                always {
+                    junit 'build/test-results/test/*.xml'
+                    jacoco(
+                        execPattern: 'build/jacoco/*.exec',
+                        classPattern: 'build/classes/java/main',
+                        sourcePattern: 'src/main/java',
+                        exclusionPattern: '**/*Test*.class'
+                    )
                 }
             }
         }
+        
+        stage('Static Code Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh '''
+                        ./gradlew sonarqube \
+                          -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                          -Dsonar.projectName="${SONAR_PROJECT_KEY}" \
+                          -Dsonar.coverage.jacoco.xmlReportPaths=build/reports/jacoco/test/jacocoTestReport.xml
+                    '''
+                }
+            }
+        }
+        
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    sh """
+                        docker build -t ${env.DOCKER_IMAGE_VERSION} \
+                            --build-arg APP_VERSION=${env.PROJECT_VERSION} \
+                            --build-arg BUILD_NUMBER=${env.BUILD_NUMBER} \
+                            --build-arg GIT_COMMIT=${env.GIT_COMMIT_HASH} \
+                            --no-cache .
+                        docker tag ${env.DOCKER_IMAGE_VERSION} ${env.DOCKER_IMAGE_LATEST}
+                    """
+                }
+            }
+        }
+        
+        stage('Scan Docker Image') {
+            steps {
+                sh "trivy image --severity HIGH,CRITICAL ${env.DOCKER_IMAGE_VERSION}"
+            }
+        }
+        
+        stage('Push Docker Image') {
+            when {
+                branch 'main'
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: env.DOCKER_CREDENTIALS_ID, passwordVariable: 'DOCKER_PASSWORD', usernameVariable: 'DOCKER_USERNAME')]) {
+                    sh """
+                        echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USERNAME}" --password-stdin ${env.DOCKER_REGISTRY}
+                        docker push ${env.DOCKER_IMAGE_VERSION}
+                        docker push ${env.DOCKER_IMAGE_LATEST}
+                    """
+                }
+            }
+        }
+        
+        stage('Deploy to Development') {
+            when {
+                branch 'main'
+            }
+            steps {
+                echo "Deploying to dev environment..."
+                // This would typically involve Helm/Kubernetes or SSH to deploy to an EC2 instance
+                
+                // Example for EC2 deployment:
+                /*
+                withCredentials([sshUserPrivateKey(credentialsId: 'ec2-ssh-key', keyFileVariable: 'SSH_KEY')]) {
+                    sh """
+                        ssh -i ${SSH_KEY} -o StrictHostKeyChecking=no ubuntu@dev-server.example.com <<EOF
+                        docker pull ${env.DOCKER_IMAGE_VERSION}
+                        docker stop java-app || true
+                        docker rm java-app || true
+                        docker run -d --name java-app -p 8080:8080 ${env.DOCKER_IMAGE_VERSION}
+                        EOF
+                    """
+                }
+                */
+            }
+        }
     }
+    
     post {
         always {
-            cleanWs()
-        }
-        success {
-            echo 'Pipeline succeeded!'
-        }
-        failure {
-            echo 'Pipeline failed!'
+            // Clean up local Docker images to save space
+            sh """
+                docker rmi ${env.DOCKER_IMAGE_VERSION} || true
+                docker rmi ${env.DOCKER_IMAGE_LATEST} || true
+                docker system prune -f || true
+            """
+            
+            // Archive artifacts
+            archiveArtifacts artifacts: 'build/libs/*.jar', fingerprint: true
+            
+            // Send notifications
+            emailext (
+                subject: "Build ${currentBuild.currentResult}: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
+                body: """<p>Build Status: ${currentBuild.currentResult}</p>
+                <p>Build Number: ${env.BUILD_NUMBER}</p>
+                <p>Check console output at <a href='${env.BUILD_URL}'>${env.JOB_NAME} [${env.BUILD_NUMBER}]</a></p>""",
+                recipientProviders: [[$class: 'DevelopersRecipientProvider'], [$class: 'RequesterRecipientProvider']]
+            )
         }
     }
 }
