@@ -5,7 +5,7 @@ pipeline {
         DOCKER_REGISTRY = 'docker.io'
         DOCKER_REPOSITORY = 'wahbamousa/java-sample-app'
         DOCKER_CREDENTIALS_ID = 'dockerhub-credentials'
-        SONAR_PROJECT_KEY = 'java-sample-app'
+        SONAR_PROJECT_KEY = 'DevOps-Stack-Test-Repo-Java'
         APP_VERSION = "${env.BUILD_NUMBER}"
     }
 
