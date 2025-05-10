@@ -1,3 +1,6 @@
+// Purpose: Build, test, analyze, and deploy a Gradle-based Java app using the java agent.
+// Key Environment Variables: Same dotnet app structure, but:
+// SONAR_PROJECT_KEY: specific to this Java repo, No manual DOTNET settings required.
 pipeline {
     agent { label 'java' }
 
@@ -17,11 +20,11 @@ pipeline {
     }
 
     stages {
-        stage('Checkout') {
+        stage('Checkout') { // Gets latest code via checkout scm
             steps { checkout scm }
         }
 
-        stage('Set Variables') {
+        stage('Set Variables') { // Sets commit hash, Docker tags, and extracts version from Gradle
             steps {
                 script {
                     env.GIT_COMMIT_HASH = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
@@ -33,13 +36,13 @@ pipeline {
             }
         }
 
-        stage('Build & Test') {
+        stage('Build & Test') { // Uses ./gradlew clean build test
             steps {
                 sh './gradlew clean build test -x integrationTest'
             }
         }
 
-        stage('Code Coverage & Reports') {
+        stage('Code Coverage & Reports') { // Publishes JUnit and JaCoCo results
             steps {
                 junit 'build/test-results/test/*.xml'
                 jacoco(
@@ -51,7 +54,7 @@ pipeline {
             }
         }
 
-        stage('SonarQube Analysis') {
+        stage('SonarQube Analysis') { // Sends code quality report + coverage to SonarQube
             steps {
                 withSonarQubeEnv('SonarQube') {
                     sh './gradlew sonarqube -Dsonar.projectKey=${SONAR_PROJECT_KEY} -Dsonar.coverage.jacoco.xmlReportPaths=build/reports/jacoco/test/jacocoTestReport.xml'
@@ -59,7 +62,7 @@ pipeline {
             }
         }
 
-        stage('Wait for Quality Gate') {
+        stage('Wait for Quality Gate') { // Waits up to 10 mins for Sonar to approve
             steps {
                 timeout(time: 10, unit: 'MINUTES') {
                     waitForQualityGate abortPipeline: true
@@ -67,7 +70,7 @@ pipeline {
             }
         }
 
-        stage('Build Docker Image') {
+        stage('Build Docker Image') { // Uses multi-tag strategy (version + latest)
             steps {
                 sh """
                     docker build -t ${DOCKER_IMAGE_VERSION} \
@@ -80,13 +83,13 @@ pipeline {
             }
         }
 
-        stage('Scan Docker Image') {
+        stage('Scan Docker Image') { // Runs Trivy for vulnerability scan
             steps {
                 sh "trivy image --severity HIGH,CRITICAL ${DOCKER_IMAGE_VERSION}"
             }
         }
 
-        stage('Push Docker Image') {
+        stage('Push Docker Image') { // Pushes both tags to DockerHub (main branch only)
             when { branch 'main' }
             steps {
                 withCredentials([usernamePassword(credentialsId: DOCKER_CREDENTIALS_ID, usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
@@ -99,7 +102,7 @@ pipeline {
             }
         }
 
-        stage('Deploy (Placeholder)') {
+        stage('Deploy (Placeholder)') { //	Placeholder for actual deployment
             when { branch 'main' }
             steps {
                 echo 'Deploy to dev server or K8s here...'
@@ -108,13 +111,13 @@ pipeline {
     }
 
     post {
-        always {
+        always { // Remove images, run docker system prune
             sh """
                 docker rmi ${DOCKER_IMAGE_VERSION} || true
                 docker rmi ${DOCKER_IMAGE_LATEST} || true
                 docker system prune -f || true
             """
-            archiveArtifacts artifacts: 'build/libs/*.jar', fingerprint: true
+            archiveArtifacts artifacts: 'build/libs/*.jar', fingerprint: true // Archive compiled .jar files
         }
     }
 }
