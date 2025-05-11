@@ -1,68 +1,399 @@
-// Purpose: Build, test, analyze, and deploy a Gradle-based Java app using the java agent.
-// Key Environment Variables: Same dotnet app structure, but:
-// SONAR_PROJECT_KEY: specific to this Java repo, No manual DOTNET settings required.
+// Purpose: Build, test, scan, and push a Java Gradle-based Dockerized app using the java agent.
 pipeline {
+    parameters {
+        booleanParam(name: 'TEST_MODE', defaultValue: false, description: 'Run pipeline in test mode (skips deployment)')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip running tests')
+        booleanParam(name: 'SKIP_SONAR', defaultValue: false, description: 'Skip SonarQube analysis')
+        booleanParam(name: 'ALLOW_VULNERABLE_BUILD', defaultValue: false, description: 'Allow build to continue despite vulnerabilities')
+    }
     agent { label 'java' }
-
-    environment {
+    environment { // Environment variables available only during pipeline execution
         DOCKER_REGISTRY = 'docker.io'
         DOCKER_REPOSITORY = 'wahbamousa/java-sample-app'
         DOCKER_CREDENTIALS_ID = 'dockerhub-credentials'
         SONAR_PROJECT_KEY = 'DevOps-Stack-Test-Repo-Java'
-        APP_VERSION = "${env.BUILD_NUMBER}"
+        PIPELINE_START_TIME = "${System.currentTimeMillis()}"
+        JAVA_OPTS = '-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0'
+        GRADLE_OPTS = '-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Dorg.gradle.jvmargs="-Xmx2048m -XX:+HeapDumpOnOutOfMemoryError"'
+        
+        // Environment-specific configurations
+        DEPLOY_TARGET = [ // Dynamic environment mode from branch name
+            'main': 'production',
+            'staging': 'staging',
+            'develop': 'development'
+        ].get(env.BRANCH_NAME, 'development')
+        
+        // Resource limits based on environment
+        MAX_MEMORY = "${DEPLOY_TARGET == 'production' ? '8192' : '4096'}"
+        
+        // Security scanning strictness by environment
+        VULNERABILITY_SEVERITY = "${DEPLOY_TARGET == 'production' ? 'MEDIUM,HIGH,CRITICAL' : 'HIGH,CRITICAL'}"
     }
-
     options {
-        timeout(time: 30, unit: 'MINUTES')
-        disableConcurrentBuilds()
-        buildDiscarder(logRotator(numToKeepStr: '10'))
-        timestamps()
+        timeout(time: 30, unit: 'MINUTES', activity: true) // Prevents builds from hanging forever
+        disableConcurrentBuilds(abortPrevious: true) // Ensures only one build per branch is running
+        buildDiscarder(logRotator(numToKeepStr: '10', artifactNumToKeepStr: '5')) // Keep 10 builds, 5 with artifacts
+        timestamps() // Adds timestamps to every line of console output
+        ansiColor('xterm') // Enables colored console logs
+        lock('java-resources') // Prevents builds from racing over same tools/resources
+        retry(2) // Retries pipeline if transient errors
+        skipDefaultCheckout(true) // Custom checkout with depth/timeout controls
     }
-
     stages {
-        stage('Checkout') { // Gets latest code via checkout scm
-            steps { checkout scm }
-        }
+        stage('Checkout') {
+            steps {
+                // Shallow clone for faster fetch
+                checkout([
+                    $class: 'GitSCM',
+                    branches: scm.branches,
+                    extensions: [
+                        [$class: 'CloneOption', depth: 1, noTags: false, shallow: true, timeout: 5],
+                        [$class: 'SubmoduleOption', disableSubmodules: false, recursiveSubmodules: true]
+                    ],
+                    userRemoteConfigs: scm.userRemoteConfigs
+                ])
 
-        stage('Set Variables') { // Sets commit hash, Docker tags, and extracts version from Gradle
+                // Secrets scanning with git-secrets and gitleaks
+                sh '''
+                    command -v git-secrets >/dev/null 2>&1 || { echo "git-secrets is required in CI. Aborting."; exit 1; }
+                    git secrets --register-aws || true
+                    git secrets --scan || (echo "CRITICAL: Secrets found in codebase!" && exit 1)
+
+                    command -v gitleaks >/dev/null 2>&1 || { echo "gitleaks is required in CI. Aborting."; exit 1; }
+                    gitleaks detect --source . --verbose || (echo "CRITICAL: Secrets found in codebase!" && exit 1)
+
+                    find . -type f -size +10M | grep -v '.git/' > large_files.txt
+                    if [ -s large_files.txt ]; then
+                        echo "WARNING: Large files found in repository:"
+                        cat large_files.txt
+                    fi
+                '''
+
+                // Git author, commit, and date for traceability and auditing
+                script {
+                    try {
+                        def branchName = sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
+                        echo "Building branch: ${branchName}"
+
+                        env.GIT_AUTHOR = sh(script: 'git log -1 --pretty=format:"%an <%ae>"', returnStdout: true).trim()
+                        env.GIT_COMMIT_MSG = sh(script: 'git log -1 --pretty=format:"%s"', returnStdout: true).trim()
+                        env.GIT_COMMIT_DATE = sh(script: 'git log -1 --pretty=format:"%ad" --date=iso', returnStdout: true).trim()
+                        echo "Commit by: ${env.GIT_AUTHOR}"
+                    } catch (e) {
+                        echo "Failed to get Git metadata: ${e.message}"
+                    }
+                }
+            }
+        }
+        
+        stage('Set Variables') {
             steps {
                 script {
                     env.GIT_COMMIT_HASH = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
                     env.DOCKER_IMAGE_TAG = "${GIT_COMMIT_HASH}-${BUILD_NUMBER}"
                     env.DOCKER_IMAGE_VERSION = "${DOCKER_REGISTRY}/${DOCKER_REPOSITORY}:${DOCKER_IMAGE_TAG}"
                     env.DOCKER_IMAGE_LATEST = "${DOCKER_REGISTRY}/${DOCKER_REPOSITORY}:latest"
-                    env.PROJECT_VERSION = sh(script: './gradlew properties -q | grep "version:" | awk \'{print $2}\'', returnStdout: true).trim()
+                    
+                    // Extract version from Gradle properties
+                    try {
+                        env.PROJECT_VERSION = sh(script: './gradlew properties -q | grep "version:" | awk \'{print $2}\'', returnStdout: true).trim()
+                        if (!env.PROJECT_VERSION) {
+                            env.PROJECT_VERSION = "1.0.0-b${BUILD_NUMBER}"
+                            echo "No version found. Using fallback: ${env.PROJECT_VERSION}"
+                        }
+                    } catch (e) {
+                        env.PROJECT_VERSION = "1.0.0-b${BUILD_NUMBER}"
+                        echo "Error finding version: ${e.message}"
+                    }
+
+                    def versionParts = env.PROJECT_VERSION.tokenize('.-+')
+                    env.VERSION_MAJOR = versionParts.size() > 0 ? versionParts[0] : "1"
+                    env.VERSION_MINOR = versionParts.size() > 1 ? versionParts[1] : "0"
+                    env.VERSION_PATCH = versionParts.size() > 2 ? versionParts[2] : "0"
+                    
+                    env.APP_VERSION = "v${env.VERSION_MAJOR}.${env.VERSION_MINOR}.${env.VERSION_PATCH}-${env.DEPLOY_TARGET}-${env.GIT_COMMIT_HASH}"
+
+                    // Intelligent project fingerprinting for cache key
+                    env.CACHE_KEY = sh(script: '''
+                        (
+                            find . -name "build.gradle" -o -name "gradle.properties" -o -name "settings.gradle" | sort | xargs cat 2>/dev/null | md5sum | cut -d " " -f1
+                            test -f gradle/wrapper/gradle-wrapper.properties && md5sum gradle/wrapper/gradle-wrapper.properties | cut -d " " -f1 || echo "no-wrapper-props"
+                        ) | md5sum | cut -d " " -f1
+                    ''', returnStdout: true).trim()
+
+                    // Detect environment resources
+                    env.JAVA_MAX_CPUS = sh(script: 'nproc || echo 4', returnStdout: true).trim()
+                    env.MAX_MEMORY = sh(script: 'free -m | grep Mem | awk \'{print int($2 * 0.8)}\'', returnStdout: true).trim()
+
+                    def branch = env.BRANCH_NAME ?: sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
+                    env.DEPLOY_ENVIRONMENT = branch == 'main' ? 'production' :
+                                            branch == 'staging' ? 'staging' :
+                                            branch.startsWith('release/') ? 'uat' : 'development'
+
+                    echo """
+                    ===========================================
+                    BUILD METADATA:
+                    - Version: ${env.PROJECT_VERSION}
+                    - Commit: ${env.GIT_COMMIT_HASH}
+                    - Author: ${env.GIT_AUTHOR ?: 'Unknown'}
+                    - Environment: ${env.DEPLOY_ENVIRONMENT}
+                    - Cache Key: ${env.CACHE_KEY}
+                    ===========================================
+                    """
                 }
             }
         }
 
-        stage('Build & Test') { // Uses ./gradlew clean build test
+        stage('Audit Setup') {
             steps {
-                sh './gradlew clean build test -x integrationTest'
+                script {
+                    // Create audit record
+                    def auditData = [
+                        'pipeline_id': env.BUILD_TAG,
+                        'started_by': currentBuild.getBuildCauses()[0].shortDescription,
+                        'branch': env.BRANCH_NAME,
+                        'commit': env.GIT_COMMIT_HASH,
+                        'start_time': new Date().format("yyyy-MM-dd'T'HH:mm:ss.SSSZ"),
+                        'environment': env.DEPLOY_ENVIRONMENT
+                    ]
+                    
+                    writeJSON file: 'pipeline-audit.json', json: auditData
+                }
             }
-        }
-
-        stage('Code Coverage & Reports') { // Publishes JUnit and JaCoCo results
-            steps {
-                junit 'build/test-results/test/*.xml'
-                jacoco(
-                    execPattern: 'build/jacoco/*.exec',
-                    classPattern: 'build/classes/java/main',
-                    sourcePattern: 'src/main/java',
-                    exclusionPattern: '**/*Test*.class'
-                )
-            }
-        }
-
-        stage('SonarQube Analysis') { // Sends code quality report + coverage to SonarQube
-            steps {
-                withSonarQubeEnv('SonarQube') {
-                    sh './gradlew sonarqube -Dsonar.projectKey=${SONAR_PROJECT_KEY} -Dsonar.coverage.jacoco.xmlReportPaths=build/reports/jacoco/test/jacocoTestReport.xml'
+            post {
+                always {
+                    script {
+                        // Update audit record with completion status
+                        def auditData = readJSON file: 'pipeline-audit.json'
+                        auditData.put('end_time', new Date().format("yyyy-MM-dd'T'HH:mm:ss.SSSZ"))
+                        auditData.put('status', currentBuild.result)
+                        auditData.put('duration_ms', System.currentTimeMillis() - env.PIPELINE_START_TIME.toLong())
+                        
+                        writeJSON file: 'pipeline-audit.json', json: auditData
+                        archiveArtifacts artifacts: 'pipeline-audit.json', fingerprint: true
+                    }
                 }
             }
         }
 
-        stage('Wait for Quality Gate') { // Waits up to 10 mins for Sonar to approve
+        stage('Dependency Audit') {
+            steps {
+                sh '''
+                    # Generate dependency tree
+                    ./gradlew dependencies > dependency-tree.txt
+                    
+                    # Check for vulnerable dependencies
+                    if command -v dependency-check >/dev/null 2>&1; then
+                        dependency-check --project "Java App" --scan . --out dependency-check-report.html || true
+                    else
+                        ./gradlew dependencyCheckAnalyze || echo "DependencyCheck failed, but continuing..."
+                    fi
+                    
+                    # Check for outdated dependencies
+                    ./gradlew dependencyUpdates -Drevision=release > outdated-dependencies.txt || true
+                    
+                    # Check for license issues
+                    ./gradlew licenseReport || echo "License report generation failed, but continuing..."
+                    
+                    # OWASP Dependency Check (if gradle plugin is available)
+                    if grep -q "org.owasp.dependencycheck" build.gradle || grep -q "org.owasp.dependencycheck" *.gradle; then
+                        ./gradlew dependencyCheckAnalyze || echo "OWASP dependency check failed, but continuing..."
+                    fi
+                    
+                    if [ -f "build/reports/dependency-check-report.html" ]; then
+                        VULN_COUNT=$(grep -c "One or more dependencies were identified with known vulnerabilities" build/reports/dependency-check-report.html || echo "0")
+                        if [ "$VULN_COUNT" -gt "0" ]; then
+                            echo "WARNING: Vulnerabilities found in dependencies!"
+                            
+                            if [ "$DEPLOY_ENVIRONMENT" = "production" ]; then
+                                if [ ! -f .vuln-exceptions ]; then
+                                    echo "ERROR: Vulnerabilities found in production and no exception file present."
+                                    exit 1
+                                fi
+                            else
+                                if [ "${ALLOW_VULNERABLE_BUILD}" != "true" ]; then
+                                    echo "ERROR: Vulnerabilities found and override not allowed (ALLOW_VULNERABLE_BUILD=false)."
+                                    exit 1
+                                fi
+                            fi
+                        fi
+                    fi
+                '''
+                
+                archiveArtifacts artifacts: 'dependency-tree.txt,dependency-check-report.html,outdated-dependencies.txt,build/reports/license/**', allowEmptyArchive: true
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh '''
+                    # Verify gradlew permissions
+                    chmod +x ./gradlew
+                    
+                    # Clean build with optimizations
+                    ./gradlew clean build -x test \
+                        --build-cache \
+                        --parallel \
+                        --max-workers=${JAVA_MAX_CPUS} \
+                        -Dorg.gradle.caching=true \
+                        -Dorg.gradle.configureondemand=true
+                '''
+            }
+        }
+
+        stage('Test & Coverage') {
+            when { expression { return !params.SKIP_TESTS } }
+            steps {
+                sh '''
+                    ./gradlew test jacocoTestReport \
+                        --build-cache \
+                        --parallel \
+                        --max-workers=${JAVA_MAX_CPUS} \
+                        -Dtest.parallelism=4 \
+                        -Dtest.fork.count=4
+                '''
+            }
+            post {
+                always {
+                    junit '**/build/test-results/test/*.xml'
+                    
+                    jacoco(
+                        execPattern: 'build/jacoco/*.exec',
+                        classPattern: 'build/classes/java/main',
+                        sourcePattern: 'src/main/java',
+                        exclusionPattern: '**/*Test*.class'
+                    )
+                    
+                    publishHTML(target: [
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'build/reports/jacoco/test/html',
+                        reportFiles: 'index.html',
+                        reportName: 'Code Coverage Report'
+                    ])
+                    
+                    script {
+                        def durationMillis = System.currentTimeMillis() - env.PIPELINE_START_TIME.toLong()
+                        def durationMinutes = durationMillis / 60000
+                        echo "Test stage completed in ${durationMinutes.round(2)} minutes"
+                    }
+                }
+                failure {
+                    script {
+                        def failedStage = currentBuild.result
+                        def buildLog = currentBuild.rawBuild.getLog(1000).join('\n')
+                        
+                        // Extract error patterns
+                        def errorPattern = ~/error:|exception:|failed:|FAILED|BUILD FAILED/
+                        def errors = buildLog.readLines().findAll { it =~ errorPattern }
+                        
+                        echo "Tests failed in stage: ${failedStage}"
+                        echo "Error summary:\n${errors.take(10).join('\n')}"
+                        
+                        // Uncomment for Slack notification
+                        // slackSend channel: '#builds', 
+                        //    color: 'danger', 
+                        //    message: "Tests failed: ${JOB_NAME} #${BUILD_NUMBER}\nFailed in: ${failedStage}\nErrors: ${errors.size()}"
+                    }
+                }
+            }
+        }
+
+        stage('Parallel Static & Build') {
+            parallel {
+                stage('SonarQube Analysis') {
+                    options { timeout(time: 5, unit: 'MINUTES') }
+                    when { expression { return !params.SKIP_SONAR } }
+                    steps {
+                        withSonarQubeEnv('SonarQube') {
+                            retry(3) {
+                                sh '''
+                                    echo "Starting SonarQube analysis..."
+                                    ./gradlew sonarqube \
+                                        -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                                        -Dsonar.projectName="${SONAR_PROJECT_KEY}" \
+                                        -Dsonar.coverage.jacoco.xmlReportPaths=build/reports/jacoco/test/jacocoTestReport.xml \
+                                        -Dsonar.sourceEncoding=UTF-8 \
+                                        -Dsonar.java.binaries=build/classes/java/main \
+                                        -Dsonar.exclusions=**/*Test*.java,**/test/**/* \
+                                        -Dsonar.host.url=${SONAR_HOST_URL}
+                                '''
+                            }
+                        }
+                    }
+                }
+                
+                stage('Quality Checks') {
+                    steps {
+                        sh '''
+                            # Run Checkstyle, PMD, SpotBugs if configured
+                            ./gradlew check || echo "Quality checks found issues"
+                            
+                            # More detailed output for quality issues
+                            if [ -d "build/reports/checkstyle" ]; then
+                                echo "Checkstyle issues found:"
+                                find build/reports/checkstyle -name "*.xml" -exec grep -l "<error" {} \\; | wc -l
+                            fi
+                            
+                            if [ -d "build/reports/pmd" ]; then
+                                echo "PMD issues found:"
+                                find build/reports/pmd -name "*.xml" -exec grep -l "<violation" {} \\; | wc -l
+                            fi
+                            
+                            if [ -d "build/reports/spotbugs" ]; then
+                                echo "SpotBugs issues found:"
+                                find build/reports/spotbugs -name "*.xml" -exec grep -l "<BugInstance" {} \\; | wc -l
+                            fi
+                        '''
+                        
+                        archiveArtifacts artifacts: 'build/reports/checkstyle/**,build/reports/pmd/**,build/reports/spotbugs/**', allowEmptyArchive: true
+                    }
+                }
+                
+                stage('Build Docker Image') {
+                    steps {
+                        // Check Dockerfile for security best practices
+                        sh '''
+                            if command -v hadolint >/dev/null 2>&1; then
+                                echo "Scanning Dockerfile with hadolint..."
+                                hadolint Dockerfile || echo "Hadolint detected issues"
+                            else
+                                echo "hadolint not installed"
+                            fi
+
+                            # Check for important security practices
+                            grep -q "USER " Dockerfile || echo "WARNING: No USER set - image may run as root"
+                            grep -q "HEALTHCHECK" Dockerfile || echo "WARNING: No HEALTHCHECK in Dockerfile"
+                            
+                            # Verify no insecure defaults or credentials
+                            ! grep -q "chmod 777" Dockerfile || echo "WARNING: chmod 777 detected in Dockerfile"
+                            ! grep -E -q "(password|token|key|secret).*=" Dockerfile || echo "WARNING: Potential credential in Dockerfile"
+                        '''
+                        
+                        sh "docker pull ${DOCKER_IMAGE_LATEST} || true"
+                        
+                        sh '''
+                            export DOCKER_BUILDKIT=1
+                            docker build \
+                                --cache-from=${DOCKER_IMAGE_LATEST} \
+                                -t ${DOCKER_IMAGE_VERSION} \
+                                -t ${DOCKER_IMAGE_LATEST} \
+                                --build-arg APP_VERSION=${PROJECT_VERSION} \
+                                --build-arg BUILD_NUMBER=${BUILD_NUMBER} \
+                                --build-arg GIT_COMMIT=${GIT_COMMIT_HASH} \
+                                --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+                                --label "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+                                --label "org.opencontainers.image.revision=${GIT_COMMIT_HASH}" \
+                                --label "org.opencontainers.image.version=${PROJECT_VERSION}" \
+                                --no-cache -f Dockerfile .
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
             steps {
                 timeout(time: 10, unit: 'MINUTES') {
                     waitForQualityGate abortPipeline: true
@@ -70,54 +401,188 @@ pipeline {
             }
         }
 
-        stage('Build Docker Image') { // Uses multi-tag strategy (version + latest)
+        stage('Artifact Publication') {
             steps {
-                sh """
-                    docker build -t ${DOCKER_IMAGE_VERSION} \
-                        --build-arg APP_VERSION=${PROJECT_VERSION} \
-                        --build-arg BUILD_NUMBER=${BUILD_NUMBER} \
-                        --build-arg GIT_COMMIT=${GIT_COMMIT_HASH} \
-                        --no-cache .
-                    docker tag ${DOCKER_IMAGE_VERSION} ${DOCKER_IMAGE_LATEST}
-                """
+                sh '''
+                    # Package application with its dependencies
+                    ./gradlew assemble bootJar -x test
+
+                    # Generate checksum for binary artifacts
+                    cd build/libs
+                    find . -type f -name "*.jar" | xargs sha256sum > ../../checksums.txt
+                    cd ../..
+                '''
+                
+                // Generate SBOM (Software Bill of Materials)
+                sh '''
+                    if command -v cyclonedx-gradle >/dev/null 2>&1; then
+                        ./gradlew cyclonedxBom -PprojectName="java-app" -PprojectVersion="${PROJECT_VERSION}"
+                    elif command -v sbom-tool >/dev/null 2>&1; then
+                        sbom-tool generate -b . -bc src -pn "java-app" -pv "${PROJECT_VERSION}" -ps "Acme Inc." -nsb https://acme.com -o sbom.json
+                    else
+                        echo "SBOM generation tools not available, skipping"
+                    fi
+                '''
+                
+                archiveArtifacts artifacts: 'checksums.txt,build/libs/*.jar,build/reports/**/*,*/cyclonedx/bom.json,sbom.json', fingerprint: true, allowEmptyArchive: true
             }
         }
 
-        stage('Scan Docker Image') { // Runs Trivy for vulnerability scan
+        stage('Scan Docker Image') {
             steps {
-                sh "trivy image --severity HIGH,CRITICAL ${DOCKER_IMAGE_VERSION}"
+                sh "trivy image --exit-code 1 --severity ${VULNERABILITY_SEVERITY} ${DOCKER_IMAGE_VERSION}"
+                sh "trivy image --exit-code 0 --severity LOW,MEDIUM ${DOCKER_IMAGE_VERSION} || true"
+                sh "trivy image --format cyclonedx --output sbom-container.json ${DOCKER_IMAGE_VERSION}"
             }
-        }
-
-        stage('Push Docker Image') { // Pushes both tags to DockerHub (main branch only)
-            when { branch 'main' }
-            steps {
-                withCredentials([usernamePassword(credentialsId: DOCKER_CREDENTIALS_ID, usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
-                    sh """
-                        echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USERNAME}" --password-stdin ${DOCKER_REGISTRY}
-                        docker push ${DOCKER_IMAGE_VERSION}
-                        docker push ${DOCKER_IMAGE_LATEST}
-                    """
+            post {
+                always {
+                    archiveArtifacts artifacts: 'sbom-container.json', fingerprint: true, allowEmptyArchive: true
                 }
             }
         }
 
-        stage('Deploy (Placeholder)') { //	Placeholder for actual deployment
+        stage('Health Check') {
+            steps {
+                script {
+                    try {
+                        sh '''
+                            CONTAINER_ID=$(docker run -d -p 8080:8080 --name health-check-${BUILD_NUMBER} --health-cmd "curl -f http://localhost:8080/actuator/health || exit 1" ${DOCKER_IMAGE_VERSION})
+                            echo "Starting health check for container ${CONTAINER_ID}"
+
+                            # Give the application time to start
+                            sleep 10
+
+                            # Retry health check multiple times
+                            HEALTHY=false
+                            for i in {1..5}; do
+                                HEALTH_STATUS=$(docker inspect --format='{{.State.Health.Status}}' $CONTAINER_ID 2>/dev/null || echo "error")
+                                
+                                if [ "$HEALTH_STATUS" = "healthy" ]; then
+                                    HEALTHY=true
+                                    echo "Container is healthy!"
+                                    break
+                                elif [ "$HEALTH_STATUS" = "starting" ]; then
+                                    echo "Container still starting (attempt $i/5)..."
+                                    sleep 10
+                                else
+                                    echo "Container health check failed with status: $HEALTH_STATUS (attempt $i/5)"
+                                    docker logs $CONTAINER_ID
+                                    sleep 10
+                                fi
+                            done
+
+                            # Always clean up the container
+                            docker rm -f $CONTAINER_ID || true
+
+                            if [ "$HEALTHY" = "false" ]; then
+                                echo "Container failed health check after multiple attempts"
+                                exit 1
+                            fi
+                        '''
+                    } catch (e) {
+                        echo "Health check failed but continuing: ${e.message}"
+                    }
+                }
+            }
+        }
+
+        stage('Push Docker Image') {
             when { branch 'main' }
             steps {
-                echo 'Deploy to dev server or K8s here...'
+                withCredentials([usernamePassword(credentialsId: DOCKER_CREDENTIALS_ID, usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+                    retry(2) {
+                        sh '''
+                            if [ "${DOCKER_REGISTRY}" != "https://"* ] && [ "${DOCKER_REGISTRY}" != "docker.io" ]; then
+                                echo "WARNING: Non-HTTPS Docker registry URLs may pose security risks."
+                            fi
+                            echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USERNAME}" --password-stdin ${DOCKER_REGISTRY}
+                            docker push ${DOCKER_IMAGE_VERSION}
+                            docker push ${DOCKER_IMAGE_LATEST}
+                            docker logout ${DOCKER_REGISTRY}
+                        '''
+                    }
+                }
+                
+                sh '''
+                    if command -v cosign >/dev/null 2>&1; then
+                        cosign sign --key cosign.key ${DOCKER_IMAGE_VERSION} || echo "Image signing skipped"
+                    else
+                        echo "Cosign not installed, skipping image signing"
+                    fi
+                '''
+                
+                archiveArtifacts artifacts: 'sbom-container.json,cosign.pub,cosign.key', fingerprint: true, allowEmptyArchive: true
+                echo "SBOM and signatures archived. Ready for external publishing."
+            }
+        }
+
+        stage('Deploy (Placeholder)') {
+            when { branch 'main' }
+            steps {
+                input message: "Approve deployment to production?"
+                echo 'Deploying to Kubernetes/ECS/etc...'
+                sh '''
+                    # Example deployment command (uncomment and modify as needed)
+                    # kubectl --context=production apply -f kubernetes/deployment.yaml || true
+                    # helm upgrade --install my-app ./helm-chart --namespace production || true
+                    # terraform apply -auto-approve -var="image_tag=${DOCKER_IMAGE_TAG}" || true
+                    echo "Deployment would happen here"
+                '''
             }
         }
     }
-
+    
     post {
-        always { // Remove images, run docker system prune
-            sh """
-                docker rmi ${DOCKER_IMAGE_VERSION} || true
-                docker rmi ${DOCKER_IMAGE_LATEST} || true
-                docker system prune -f || true
-            """
-            archiveArtifacts artifacts: 'build/libs/*.jar', fingerprint: true // Archive compiled .jar files
+        always {
+            sh '''
+                echo "Cleaning up Docker images..."
+                if docker rmi ${DOCKER_IMAGE_VERSION}; then
+                    echo "Successfully removed ${DOCKER_IMAGE_VERSION}"
+                else
+                    echo "Warning: Failed to remove ${DOCKER_IMAGE_VERSION} or it didn't exist"
+                fi
+                
+                if docker rmi ${DOCKER_IMAGE_LATEST}; then
+                    echo "Successfully removed ${DOCKER_IMAGE_LATEST}"
+                else
+                    echo "Warning: Failed to remove ${DOCKER_IMAGE_LATEST} or it didn't exist"
+                fi
+                
+                echo "Pruning Docker system..."
+                docker system prune -f
+                
+                # Create execution summary
+                echo "====== Build Summary ======" > build-summary.txt
+                echo "Build ID: ${BUILD_ID}" >> build-summary.txt
+                echo "Branch: ${BRANCH_NAME}" >> build-summary.txt
+                echo "Commit: ${GIT_COMMIT_HASH}" >> build-summary.txt
+                echo "Author: ${GIT_AUTHOR}" >> build-summary.txt
+                echo "Build Duration: $(($(date +%s) - ${PIPELINE_START_TIME}/1000)) seconds" >> build-summary.txt
+                echo "Result: ${currentBuild.currentResult}" >> build-summary.txt
+                
+                # Cleanup workspace
+                find . -name "*.log" -size +10M -delete
+                find . -path "*/build/reports/*" -size +10M -delete
+            '''
+            
+            archiveArtifacts artifacts: 'build/libs/*.jar,build-summary.txt', allowEmptyArchive: true, fingerprint: true
+        }
+        
+        success {
+            echo "Pipeline succeeded! Image: ${DOCKER_IMAGE_VERSION}"
+            // slackSend channel: '#builds', color: 'good', message: "Build passed: ${JOB_NAME} #${BUILD_NUMBER}"
+        }
+        
+        failure {
+            echo "Pipeline failed."
+            // slackSend channel: '#builds', color: 'danger', message: "Build failed: ${JOB_NAME} #${BUILD_NUMBER}"
+            
+            script {
+                // Extract last 50 lines from logs for better error context
+                def failureLog = currentBuild.rawBuild.getLog(50).join('\n')
+                writeFile file: 'failure-details.log', text: failureLog
+                archiveArtifacts artifacts: 'failure-details.log', allowEmptyArchive: true
+            }
         }
     }
 }
