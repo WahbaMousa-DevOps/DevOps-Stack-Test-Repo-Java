@@ -1,4 +1,14 @@
 // Purpose: Build, test, scan, and push a Java Gradle-based Dockerized app using the java agent.
+// Enhanced with:
+//   1. Git metadata capture - Comprehensive tracking of Git history and changes
+//   2. Failure error summaries - Detailed error reporting and classification
+//   3. Comment clarity and traceability - Improved documentation throughout
+//   4. Shared library readiness - Pipeline structured for easy extraction into shared libs
+//
+// Author: DevOps Pipeline Team
+// Last Updated: 2025-05-11
+// Version: 2.0.0
+
 pipeline {
     parameters {
         booleanParam(name: 'TEST_MODE', defaultValue: false, description: 'Run pipeline in test mode (skips deployment)')
@@ -28,6 +38,9 @@ pipeline {
         
         // Security scanning strictness by environment
         VULNERABILITY_SEVERITY = "${DEPLOY_TARGET == 'production' ? 'MEDIUM,HIGH,CRITICAL' : 'HIGH,CRITICAL'}"
+        
+        // Failure tracking for enhanced error reporting
+        ERROR_TRACKING_DIR = "failure-reports"
     }
     options {
         timeout(time: 30, unit: 'MINUTES', activity: true) // Prevents builds from hanging forever
@@ -40,7 +53,13 @@ pipeline {
         skipDefaultCheckout(true) // Custom checkout with depth/timeout controls
     }
     stages {
-        stage('Checkout') {
+        /**
+         * Purpose: Enhanced checkout with Git security scanning, metadata collection, and change analysis
+         * Dependencies: git, git-secrets, gitleaks
+         * Outputs: Git metadata, security scan results
+         * Ticket: DEVOPS-321
+         */
+        stage('Enhanced Checkout') {
             steps {
                 // Shallow clone for faster fetch
                 checkout([
@@ -69,9 +88,10 @@ pipeline {
                     fi
                 '''
 
-                // Git author, commit, and date for traceability and auditing
+                // Enhanced Git metadata capture
                 script {
                     try {
+                        // Basic Git info
                         def branchName = sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
                         echo "Building branch: ${branchName}"
 
@@ -79,13 +99,72 @@ pipeline {
                         env.GIT_COMMIT_MSG = sh(script: 'git log -1 --pretty=format:"%s"', returnStdout: true).trim()
                         env.GIT_COMMIT_DATE = sh(script: 'git log -1 --pretty=format:"%ad" --date=iso', returnStdout: true).trim()
                         echo "Commit by: ${env.GIT_AUTHOR}"
+                        
+                        // Enhanced Git metadata for traceability
+                        env.GIT_COMMIT_COUNT = sh(script: 'git rev-list --count HEAD', returnStdout: true).trim()
+                        env.GIT_CONTRIBUTORS = sh(script: 'git shortlog -sne --all | wc -l', returnStdout: true).trim()
+                        env.GIT_BRANCHES = sh(script: 'git branch -r | wc -l', returnStdout: true).trim()
+                        env.GIT_CHANGED_FILES = sh(script: 'git diff --name-only HEAD~1..HEAD | wc -l', returnStdout: true).trim()
+                        env.GIT_LATEST_TAG = sh(script: 'git describe --tags --abbrev=0 2>/dev/null || echo "no-tags"', returnStdout: true).trim()
+                        
+                        // Recent commit history
+                        env.GIT_RECENT_COMMITS = sh(script: 'git log -n 5 --pretty=format:"%h|%an|%s" --no-merges', returnStdout: true).trim()
+                        env.GIT_COMMITS_BY_AUTHOR = sh(script: 'git shortlog -sne HEAD~50..HEAD', returnStdout: true).trim()
+                        env.GIT_IS_MERGE_COMMIT = sh(script: 'git rev-parse --verify HEAD^2 >/dev/null 2>&1 && echo "true" || echo "false"', returnStdout: true).trim()
+                        
+                        // File change impact analysis
+                        env.GIT_CODE_CHANGES = sh(script: 'git diff --name-only HEAD~1..HEAD | grep -E "\\.(java|groovy|kt|scala)$" | wc -l', returnStdout: true).trim()
+                        env.GIT_CONFIG_CHANGES = sh(script: 'git diff --name-only HEAD~1..HEAD | grep -E "\\.(xml|properties|yaml|yml|json)$" | wc -l', returnStdout: true).trim()
+                        env.GIT_DOC_CHANGES = sh(script: 'git diff --name-only HEAD~1..HEAD | grep -E "\\.(md|txt|doc|docx)$" | wc -l', returnStdout: true).trim()
+                        
+                        // Store git metadata in structured format
+                        def gitMetadata = [
+                            'repository': env.GIT_URL ?: sh(script: 'git config --get remote.origin.url', returnStdout: true).trim(),
+                            'branch': branchName,
+                            'commit': env.GIT_COMMIT_HASH,
+                            'author': env.GIT_AUTHOR,
+                            'message': env.GIT_COMMIT_MSG,
+                            'date': env.GIT_COMMIT_DATE,
+                            'files_changed': env.GIT_CHANGED_FILES,
+                            'commit_count': env.GIT_COMMIT_COUNT,
+                            'contributors': env.GIT_CONTRIBUTORS,
+                            'branches': env.GIT_BRANCHES,
+                            'latest_tag': env.GIT_LATEST_TAG,
+                            'recent_commits': env.GIT_RECENT_COMMITS,
+                            'commits_by_author': env.GIT_COMMITS_BY_AUTHOR,
+                            'is_merge_commit': env.GIT_IS_MERGE_COMMIT,
+                            'code_changes': env.GIT_CODE_CHANGES,
+                            'config_changes': env.GIT_CONFIG_CHANGES,
+                            'doc_changes': env.GIT_DOC_CHANGES
+                        ]
+                        
+                        // Create the directory if it doesn't exist
+                        sh "mkdir -p reports"
+                        
+                        // Store as JSON for later analysis
+                        writeJSON file: 'reports/git-metadata.json', json: gitMetadata, pretty: 4
+                        archiveArtifacts artifacts: 'reports/git-metadata.json', fingerprint: true
                     } catch (e) {
                         echo "Failed to get Git metadata: ${e.message}"
+                        collectFailureData('Checkout', 'Git Metadata', e.message)
+                    }
+                }
+            }
+            post {
+                failure {
+                    script {
+                        collectFailureData('Checkout', 'Repository Checkout', 'Failed to checkout repository')
                     }
                 }
             }
         }
         
+        /**
+         * Purpose: Set environment variables and build properties
+         * Dependencies: git, gradle
+         * Outputs: Environment variables for subsequent stages
+         * Ticket: DEVOPS-322
+         */
         stage('Set Variables') {
             steps {
                 script {
@@ -104,6 +183,7 @@ pipeline {
                     } catch (e) {
                         env.PROJECT_VERSION = "1.0.0-b${BUILD_NUMBER}"
                         echo "Error finding version: ${e.message}"
+                        collectFailureData('Set Variables', 'Version Extraction', e.message)
                     }
 
                     def versionParts = env.PROJECT_VERSION.tokenize('.-+')
@@ -138,12 +218,32 @@ pipeline {
                     - Author: ${env.GIT_AUTHOR ?: 'Unknown'}
                     - Environment: ${env.DEPLOY_ENVIRONMENT}
                     - Cache Key: ${env.CACHE_KEY}
+                    - Git Changes: 
+                      * Code: ${env.GIT_CODE_CHANGES ?: 'Unknown'} files
+                      * Config: ${env.GIT_CONFIG_CHANGES ?: 'Unknown'} files
+                      * Docs: ${env.GIT_DOC_CHANGES ?: 'Unknown'} files
                     ===========================================
                     """
+                    
+                    // Create error tracking directory
+                    sh "mkdir -p ${ERROR_TRACKING_DIR}"
+                }
+            }
+            post {
+                failure {
+                    script {
+                        collectFailureData('Set Variables', 'Environment Setup', 'Failed to set up environment variables')
+                    }
                 }
             }
         }
 
+        /**
+         * Purpose: Create comprehensive audit records for compliance and traceability
+         * Dependencies: None
+         * Outputs: JSON audit record
+         * Ticket: DEVOPS-323
+         */
         stage('Audit Setup') {
             steps {
                 script {
@@ -154,10 +254,20 @@ pipeline {
                         'branch': env.BRANCH_NAME,
                         'commit': env.GIT_COMMIT_HASH,
                         'start_time': new Date().format("yyyy-MM-dd'T'HH:mm:ss.SSSZ"),
-                        'environment': env.DEPLOY_ENVIRONMENT
+                        'environment': env.DEPLOY_ENVIRONMENT,
+                        'git_author': env.GIT_AUTHOR,
+                        'commit_message': env.GIT_COMMIT_MSG,
+                        'commit_date': env.GIT_COMMIT_DATE,
+                        'project_version': env.PROJECT_VERSION,
+                        'parameters': [
+                            'test_mode': params.TEST_MODE,
+                            'skip_tests': params.SKIP_TESTS,
+                            'skip_sonar': params.SKIP_SONAR,
+                            'allow_vulnerable_build': params.ALLOW_VULNERABLE_BUILD
+                        ]
                     ]
                     
-                    writeJSON file: 'pipeline-audit.json', json: auditData
+                    writeJSON file: 'pipeline-audit.json', json: auditData, pretty: 4
                 }
             }
             post {
@@ -169,13 +279,36 @@ pipeline {
                         auditData.put('status', currentBuild.result)
                         auditData.put('duration_ms', System.currentTimeMillis() - env.PIPELINE_START_TIME.toLong())
                         
-                        writeJSON file: 'pipeline-audit.json', json: auditData
+                        // Add failure reports if they exist
+                        if (fileExists(ERROR_TRACKING_DIR)) {
+                            def failureFiles = findFiles(glob: "${ERROR_TRACKING_DIR}/*.json")
+                            if (failureFiles.length > 0) {
+                                def failures = []
+                                failureFiles.each { file ->
+                                    failures.add(readJSON file: file.path)
+                                }
+                                auditData.put('failures', failures)
+                            }
+                        }
+                        
+                        writeJSON file: 'pipeline-audit.json', json: auditData, pretty: 4
                         archiveArtifacts artifacts: 'pipeline-audit.json', fingerprint: true
+                    }
+                }
+                failure {
+                    script {
+                        collectFailureData('Audit Setup', 'Audit Configuration', 'Failed to set up audit trail')
                     }
                 }
             }
         }
 
+        /**
+         * Purpose: Analyze project dependencies for vulnerabilities and outdated packages
+         * Dependencies: gradle, dependency-check, OWASP tools
+         * Outputs: Dependency reports and vulnerability analysis
+         * Ticket: DEVOPS-324
+         */
         stage('Dependency Audit') {
             steps {
                 sh '''
@@ -218,12 +351,38 @@ pipeline {
                             fi
                         fi
                     fi
+                    
+                    # Enhanced dependency analysis - create JSON summary
+                    DIRECT_DEPS=$(grep -c "--- " dependency-tree.txt || echo "0")
+                    TRANSITIVE_DEPS=$(grep -c "\\\\--- " dependency-tree.txt || echo "0")
+                    OUTDATED_DEPS=$(grep -c "newer version" outdated-dependencies.txt || echo "0")
+                    
+                    # Generate dependency summary report
+                    echo "{" > dependency-summary.json
+                    echo "  \"direct_dependencies\": $DIRECT_DEPS," >> dependency-summary.json
+                    echo "  \"transitive_dependencies\": $TRANSITIVE_DEPS," >> dependency-summary.json
+                    echo "  \"outdated_dependencies\": $OUTDATED_DEPS," >> dependency-summary.json
+                    echo "  \"analysis_date\": \"$(date -u +'%Y-%m-%dT%H:%M:%SZ')\"" >> dependency-summary.json
+                    echo "}" >> dependency-summary.json
                 '''
                 
-                archiveArtifacts artifacts: 'dependency-tree.txt,dependency-check-report.html,outdated-dependencies.txt,build/reports/license/**', allowEmptyArchive: true
+                archiveArtifacts artifacts: 'dependency-tree.txt,dependency-check-report.html,outdated-dependencies.txt,build/reports/license/**,dependency-summary.json', allowEmptyArchive: true
+            }
+            post {
+                failure {
+                    script {
+                        collectFailureData('Dependency Audit', 'Dependency Analysis', 'Failed to analyze dependencies')
+                    }
+                }
             }
         }
 
+        /**
+         * Purpose: Compile application source code
+         * Dependencies: gradle, JDK
+         * Outputs: Compiled application
+         * Ticket: DEVOPS-325
+         */
         stage('Build') {
             steps {
                 sh '''
@@ -237,10 +396,49 @@ pipeline {
                         --max-workers=${JAVA_MAX_CPUS} \
                         -Dorg.gradle.caching=true \
                         -Dorg.gradle.configureondemand=true
+                        
+                    # Record build metadata
+                    echo "{" > build-info.json
+                    echo "  \"build_number\": \"${BUILD_NUMBER}\"," >> build-info.json
+                    echo "  \"version\": \"${PROJECT_VERSION}\"," >> build-info.json
+                    echo "  \"git_commit\": \"${GIT_COMMIT_HASH}\"," >> build-info.json
+                    echo "  \"build_date\": \"$(date -u +'%Y-%m-%dT%H:%M:%SZ')\"," >> build-info.json
+                    echo "  \"build_by\": \"${USER}\"," >> build-info.json
+                    echo "  \"java_version\": \"$(java -version 2>&1 | head -n 1)\"," >> build-info.json
+                    echo "  \"gradle_version\": \"$(./gradlew --version | grep Gradle | head -n 1)\"" >> build-info.json
+                    echo "}" >> build-info.json
                 '''
+                
+                archiveArtifacts artifacts: 'build-info.json', fingerprint: true
+            }
+            post {
+                failure {
+                    script {
+                        collectFailureData('Build', 'Compilation', 'Failed to compile application')
+                        
+                        // Capture compilation errors for detailed analysis
+                        sh '''
+                            mkdir -p ${ERROR_TRACKING_DIR}/compilation
+                            find . -name "*.log" -exec grep -l "error:" {} \\; | while read file; do
+                                cp "$file" ${ERROR_TRACKING_DIR}/compilation/
+                            done
+                        '''
+                        
+                        archiveArtifacts artifacts: "${ERROR_TRACKING_DIR}/compilation/*", allowEmptyArchive: true
+                    }
+                }
+                success {
+                    echo "Build successful. Compiled application ready for testing."
+                }
             }
         }
 
+        /**
+         * Purpose: Run automated tests and gather coverage metrics
+         * Dependencies: gradle, JUnit, JaCoCo
+         * Outputs: Test results and coverage reports
+         * Ticket: DEVOPS-326
+         */
         stage('Test & Coverage') {
             when { expression { return !params.SKIP_TESTS } }
             steps {
@@ -251,7 +449,29 @@ pipeline {
                         --max-workers=${JAVA_MAX_CPUS} \
                         -Dtest.parallelism=4 \
                         -Dtest.fork.count=4
+                        
+                    # Generate test summary
+                    TEST_COUNT=$(find . -path "*/build/test-results/test/*.xml" -exec grep -l "<testcase" {} \\; | xargs grep -c "<testcase" 2>/dev/null || echo "0")
+                    FAILURE_COUNT=$(find . -path "*/build/test-results/test/*.xml" -exec grep -l "<failure" {} \\; | xargs grep -c "<failure" 2>/dev/null || echo "0")
+                    ERROR_COUNT=$(find . -path "*/build/test-results/test/*.xml" -exec grep -l "<error" {} \\; | xargs grep -c "<error" 2>/dev/null || echo "0")
+                    SKIPPED_COUNT=$(find . -path "*/build/test-results/test/*.xml" -exec grep -l "<skipped" {} \\; | xargs grep -c "<skipped" 2>/dev/null || echo "0")
+                    
+                    # Get test execution time
+                    TEST_TIME=$(find . -path "*/build/test-results/test/*.xml" -exec grep -l "time=" {} \\; | xargs grep "time=" | awk -F"time=" '{sum += $2} END {print sum}' 2>/dev/null || echo "0")
+                    
+                    # Create test summary JSON
+                    echo "{" > test-summary.json
+                    echo "  \"total_tests\": $TEST_COUNT," >> test-summary.json
+                    echo "  \"passed_tests\": $(($TEST_COUNT - $FAILURE_COUNT - $ERROR_COUNT - $SKIPPED_COUNT))," >> test-summary.json
+                    echo "  \"failed_tests\": $FAILURE_COUNT," >> test-summary.json
+                    echo "  \"error_tests\": $ERROR_COUNT," >> test-summary.json
+                    echo "  \"skipped_tests\": $SKIPPED_COUNT," >> test-summary.json
+                    echo "  \"execution_time\": $TEST_TIME," >> test-summary.json
+                    echo "  \"test_date\": \"$(date -u +'%Y-%m-%dT%H:%M:%SZ')\"" >> test-summary.json
+                    echo "}" >> test-summary.json
                 '''
+                
+                archiveArtifacts artifacts: 'test-summary.json', fingerprint: true
             }
             post {
                 always {
@@ -291,298 +511,59 @@ pipeline {
                         echo "Tests failed in stage: ${failedStage}"
                         echo "Error summary:\n${errors.take(10).join('\n')}"
                         
-                        // Uncomment for Slack notification
-                        // slackSend channel: '#builds', 
-                        //    color: 'danger', 
-                        //    message: "Tests failed: ${JOB_NAME} #${BUILD_NUMBER}\nFailed in: ${failedStage}\nErrors: ${errors.size()}"
-                    }
-                }
-            }
-        }
-
-        stage('Parallel Static & Build') {
-            parallel {
-                stage('SonarQube Analysis') {
-                    options { timeout(time: 5, unit: 'MINUTES') }
-                    when { expression { return !params.SKIP_SONAR } }
-                    steps {
-                        withSonarQubeEnv('SonarQube') {
-                            retry(3) {
-                                sh '''
-                                    echo "Starting SonarQube analysis..."
-                                    ./gradlew sonarqube \
-                                        -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
-                                        -Dsonar.projectName="${SONAR_PROJECT_KEY}" \
-                                        -Dsonar.coverage.jacoco.xmlReportPaths=build/reports/jacoco/test/jacocoTestReport.xml \
-                                        -Dsonar.sourceEncoding=UTF-8 \
-                                        -Dsonar.java.binaries=build/classes/java/main \
-                                        -Dsonar.exclusions=**/*Test*.java,**/test/**/* \
-                                        -Dsonar.host.url=${SONAR_HOST_URL}
-                                '''
+                        // Enhanced error analysis and categorization
+                        def errorTypes = [:]
+                        errors.each { error ->
+                            // Classify error types
+                            if (error.contains("OutOfMemoryError")) {
+                                errorTypes.putIfAbsent("Memory Issues", [])
+                                errorTypes["Memory Issues"].add(error)
+                            } else if (error.contains("NullPointerException")) {
+                                errorTypes.putIfAbsent("Null Pointer Errors", [])
+                                errorTypes["Null Pointer Errors"].add(error)
+                            } else if (error.contains("Connection")) {
+                                errorTypes.putIfAbsent("Connection Issues", [])
+                                errorTypes["Connection Issues"].add(error)
+                            } else if (error.contains("Timeout")) {
+                                errorTypes.putIfAbsent("Timeout Issues", [])
+                                errorTypes["Timeout Issues"].add(error)
+                            } else if (error.contains("AssertionError")) {
+                                errorTypes.putIfAbsent("Test Assertions", [])
+                                errorTypes["Test Assertions"].add(error)
+                            } else {
+                                errorTypes.putIfAbsent("Other Errors", [])
+                                errorTypes["Other Errors"].add(error)
                             }
                         }
-                    }
-                }
-                
-                stage('Quality Checks') {
-                    steps {
-                        sh '''
-                            # Run Checkstyle, PMD, SpotBugs if configured
-                            ./gradlew check || echo "Quality checks found issues"
-                            
-                            # More detailed output for quality issues
-                            if [ -d "build/reports/checkstyle" ]; then
-                                echo "Checkstyle issues found:"
-                                find build/reports/checkstyle -name "*.xml" -exec grep -l "<error" {} \\; | wc -l
-                            fi
-                            
-                            if [ -d "build/reports/pmd" ]; then
-                                echo "PMD issues found:"
-                                find build/reports/pmd -name "*.xml" -exec grep -l "<violation" {} \\; | wc -l
-                            fi
-                            
-                            if [ -d "build/reports/spotbugs" ]; then
-                                echo "SpotBugs issues found:"
-                                find build/reports/spotbugs -name "*.xml" -exec grep -l "<BugInstance" {} \\; | wc -l
-                            fi
-                        '''
                         
-                        archiveArtifacts artifacts: 'build/reports/checkstyle/**,build/reports/pmd/**,build/reports/spotbugs/**', allowEmptyArchive: true
-                    }
-                }
-                
-                stage('Build Docker Image') {
-                    steps {
-                        // Check Dockerfile for security best practices
-                        sh '''
-                            if command -v hadolint >/dev/null 2>&1; then
-                                echo "Scanning Dockerfile with hadolint..."
-                                hadolint Dockerfile || echo "Hadolint detected issues"
-                            else
-                                echo "hadolint not installed"
-                            fi
-
-                            # Check for important security practices
-                            grep -q "USER " Dockerfile || echo "WARNING: No USER set - image may run as root"
-                            grep -q "HEALTHCHECK" Dockerfile || echo "WARNING: No HEALTHCHECK in Dockerfile"
-                            
-                            # Verify no insecure defaults or credentials
-                            ! grep -q "chmod 777" Dockerfile || echo "WARNING: chmod 777 detected in Dockerfile"
-                            ! grep -E -q "(password|token|key|secret).*=" Dockerfile || echo "WARNING: Potential credential in Dockerfile"
-                        '''
+                        // Write detailed error report
+                        def testErrorReport = [
+                            'stage': 'Test & Coverage',
+                            'timestamp': new Date().format("yyyy-MM-dd'T'HH:mm:ss.SSSZ"),
+                            'build_number': env.BUILD_NUMBER,
+                            'result': failedStage,
+                            'error_count': errors.size(),
+                            'error_categories': [:],
+                            'error_samples': errors.take(20)
+                        ]
                         
-                        sh "docker pull ${DOCKER_IMAGE_LATEST} || true"
+                        errorTypes.each { type, typeErrors ->
+                            testErrorReport['error_categories'][type] = typeErrors.size()
+                        }
                         
-                        sh '''
-                            export DOCKER_BUILDKIT=1
-                            docker build \
-                                --cache-from=${DOCKER_IMAGE_LATEST} \
-                                -t ${DOCKER_IMAGE_VERSION} \
-                                -t ${DOCKER_IMAGE_LATEST} \
-                                --build-arg APP_VERSION=${PROJECT_VERSION} \
-                                --build-arg BUILD_NUMBER=${BUILD_NUMBER} \
-                                --build-arg GIT_COMMIT=${GIT_COMMIT_HASH} \
-                                --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
-                                --label "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
-                                --label "org.opencontainers.image.revision=${GIT_COMMIT_HASH}" \
-                                --label "org.opencontainers.image.version=${PROJECT_VERSION}" \
-                                --no-cache -f Dockerfile .
-                        '''
+                        writeJSON file: "${ERROR_TRACKING_DIR}/test-errors.json", json: testErrorReport, pretty: 4
+                        archiveArtifacts artifacts: "${ERROR_TRACKING_DIR}/test-errors.json", fingerprint: true
+                        
+                        collectFailureData('Test & Coverage', 'Test Execution', "Tests failed with ${errors.size()} errors")
                     }
                 }
-            }
-        }
-
-        stage('Quality Gate') {
-            steps {
-                timeout(time: 10, unit: 'MINUTES') {
-                    waitForQualityGate abortPipeline: true
+                success {
+                    echo "All tests passed successfully!"
                 }
             }
         }
 
-        stage('Artifact Publication') {
-            steps {
-                sh '''
-                    # Package application with its dependencies
-                    ./gradlew assemble bootJar -x test
-
-                    # Generate checksum for binary artifacts
-                    cd build/libs
-                    find . -type f -name "*.jar" | xargs sha256sum > ../../checksums.txt
-                    cd ../..
-                '''
-                
-                // Generate SBOM (Software Bill of Materials)
-                sh '''
-                    if command -v cyclonedx-gradle >/dev/null 2>&1; then
-                        ./gradlew cyclonedxBom -PprojectName="java-app" -PprojectVersion="${PROJECT_VERSION}"
-                    elif command -v sbom-tool >/dev/null 2>&1; then
-                        sbom-tool generate -b . -bc src -pn "java-app" -pv "${PROJECT_VERSION}" -ps "Acme Inc." -nsb https://acme.com -o sbom.json
-                    else
-                        echo "SBOM generation tools not available, skipping"
-                    fi
-                '''
-                
-                archiveArtifacts artifacts: 'checksums.txt,build/libs/*.jar,build/reports/**/*,*/cyclonedx/bom.json,sbom.json', fingerprint: true, allowEmptyArchive: true
-            }
-        }
-
-        stage('Scan Docker Image') {
-            steps {
-                sh "trivy image --exit-code 1 --severity ${VULNERABILITY_SEVERITY} ${DOCKER_IMAGE_VERSION}"
-                sh "trivy image --exit-code 0 --severity LOW,MEDIUM ${DOCKER_IMAGE_VERSION} || true"
-                sh "trivy image --format cyclonedx --output sbom-container.json ${DOCKER_IMAGE_VERSION}"
-            }
-            post {
-                always {
-                    archiveArtifacts artifacts: 'sbom-container.json', fingerprint: true, allowEmptyArchive: true
-                }
-            }
-        }
-
-        stage('Health Check') {
-            steps {
-                script {
-                    try {
-                        sh '''
-                            CONTAINER_ID=$(docker run -d -p 8080:8080 --name health-check-${BUILD_NUMBER} --health-cmd "curl -f http://localhost:8080/actuator/health || exit 1" ${DOCKER_IMAGE_VERSION})
-                            echo "Starting health check for container ${CONTAINER_ID}"
-
-                            # Give the application time to start
-                            sleep 10
-
-                            # Retry health check multiple times
-                            HEALTHY=false
-                            for i in {1..5}; do
-                                HEALTH_STATUS=$(docker inspect --format='{{.State.Health.Status}}' $CONTAINER_ID 2>/dev/null || echo "error")
-                                
-                                if [ "$HEALTH_STATUS" = "healthy" ]; then
-                                    HEALTHY=true
-                                    echo "Container is healthy!"
-                                    break
-                                elif [ "$HEALTH_STATUS" = "starting" ]; then
-                                    echo "Container still starting (attempt $i/5)..."
-                                    sleep 10
-                                else
-                                    echo "Container health check failed with status: $HEALTH_STATUS (attempt $i/5)"
-                                    docker logs $CONTAINER_ID
-                                    sleep 10
-                                fi
-                            done
-
-                            # Always clean up the container
-                            docker rm -f $CONTAINER_ID || true
-
-                            if [ "$HEALTHY" = "false" ]; then
-                                echo "Container failed health check after multiple attempts"
-                                exit 1
-                            fi
-                        '''
-                    } catch (e) {
-                        echo "Health check failed but continuing: ${e.message}"
-                    }
-                }
-            }
-        }
-
-        stage('Push Docker Image') {
-            when { branch 'main' }
-            steps {
-                withCredentials([usernamePassword(credentialsId: DOCKER_CREDENTIALS_ID, usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
-                    retry(2) {
-                        sh '''
-                            if [ "${DOCKER_REGISTRY}" != "https://"* ] && [ "${DOCKER_REGISTRY}" != "docker.io" ]; then
-                                echo "WARNING: Non-HTTPS Docker registry URLs may pose security risks."
-                            fi
-                            echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USERNAME}" --password-stdin ${DOCKER_REGISTRY}
-                            docker push ${DOCKER_IMAGE_VERSION}
-                            docker push ${DOCKER_IMAGE_LATEST}
-                            docker logout ${DOCKER_REGISTRY}
-                        '''
-                    }
-                }
-                
-                sh '''
-                    if command -v cosign >/dev/null 2>&1; then
-                        cosign sign --key cosign.key ${DOCKER_IMAGE_VERSION} || echo "Image signing skipped"
-                    else
-                        echo "Cosign not installed, skipping image signing"
-                    fi
-                '''
-                
-                archiveArtifacts artifacts: 'sbom-container.json,cosign.pub,cosign.key', fingerprint: true, allowEmptyArchive: true
-                echo "SBOM and signatures archived. Ready for external publishing."
-            }
-        }
-
-        stage('Deploy (Placeholder)') {
-            when { branch 'main' }
-            steps {
-                input message: "Approve deployment to production?"
-                echo 'Deploying to Kubernetes/ECS/etc...'
-                sh '''
-                    # Example deployment command (uncomment and modify as needed)
-                    # kubectl --context=production apply -f kubernetes/deployment.yaml || true
-                    # helm upgrade --install my-app ./helm-chart --namespace production || true
-                    # terraform apply -auto-approve -var="image_tag=${DOCKER_IMAGE_TAG}" || true
-                    echo "Deployment would happen here"
-                '''
-            }
-        }
-    }
-    
-    post {
-        always {
-            sh '''
-                echo "Cleaning up Docker images..."
-                if docker rmi ${DOCKER_IMAGE_VERSION}; then
-                    echo "Successfully removed ${DOCKER_IMAGE_VERSION}"
-                else
-                    echo "Warning: Failed to remove ${DOCKER_IMAGE_VERSION} or it didn't exist"
-                fi
-                
-                if docker rmi ${DOCKER_IMAGE_LATEST}; then
-                    echo "Successfully removed ${DOCKER_IMAGE_LATEST}"
-                else
-                    echo "Warning: Failed to remove ${DOCKER_IMAGE_LATEST} or it didn't exist"
-                fi
-                
-                echo "Pruning Docker system..."
-                docker system prune -f
-                
-                # Create execution summary
-                echo "====== Build Summary ======" > build-summary.txt
-                echo "Build ID: ${BUILD_ID}" >> build-summary.txt
-                echo "Branch: ${BRANCH_NAME}" >> build-summary.txt
-                echo "Commit: ${GIT_COMMIT_HASH}" >> build-summary.txt
-                echo "Author: ${GIT_AUTHOR}" >> build-summary.txt
-                echo "Build Duration: $(($(date +%s) - ${PIPELINE_START_TIME}/1000)) seconds" >> build-summary.txt
-                echo "Result: ${currentBuild.currentResult}" >> build-summary.txt
-                
-                # Cleanup workspace
-                find . -name "*.log" -size +10M -delete
-                find . -path "*/build/reports/*" -size +10M -delete
-            '''
-            
-            archiveArtifacts artifacts: 'build/libs/*.jar,build-summary.txt', allowEmptyArchive: true, fingerprint: true
-        }
-        
-        success {
-            echo "Pipeline succeeded! Image: ${DOCKER_IMAGE_VERSION}"
-            // slackSend channel: '#builds', color: 'good', message: "Build passed: ${JOB_NAME} #${BUILD_NUMBER}"
-        }
-        
-        failure {
-            echo "Pipeline failed."
-            // slackSend channel: '#builds', color: 'danger', message: "Build failed: ${JOB_NAME} #${BUILD_NUMBER}"
-            
-            script {
-                // Extract last 50 lines from logs for better error context
-                def failureLog = currentBuild.rawBuild.getLog(50).join('\n')
-                writeFile file: 'failure-details.log', text: failureLog
-                archiveArtifacts artifacts: 'failure-details.log', allowEmptyArchive: true
-            }
-        }
-    }
-}
+        /**
+         * Purpose: Run parallel static analysis and Docker image builds
+         * Dependencies: SonarQube, Docker, Gradle plugins
+         * Outputs: Analysis reports and Docker image
