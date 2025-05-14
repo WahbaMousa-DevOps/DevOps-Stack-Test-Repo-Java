@@ -1,0 +1,436 @@
+name: CI - Enhanced Java Build (Migration from Jenkins)
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Run pipeline in test mode (skips deployment)'
+        type: boolean
+        default: false
+      skip_tests:
+        description: 'Skip running tests'
+        type: boolean
+        default: false
+      skip_sonar:
+        description: 'Skip SonarQube analysis'
+        type: boolean
+        default: false
+      allow_vulnerable_build:
+        description: 'Allow build to continue despite vulnerabilities'
+        type: boolean
+        default: false
+
+  push:
+    branches:
+      - main
+      - staging
+      - develop
+      - 'feature/**'
+      - 'release/**'
+
+  pull_request:
+    branches:
+      - main
+      - staging
+      - develop
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  DOCKER_REGISTRY: docker.io
+  DOCKER_REPOSITORY: wahbamousa/java-sample-app
+  SONAR_PROJECT_KEY: DevOps-Stack-Test-Repo-Java
+  JAVA_OPTS: -XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0
+  GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Dorg.gradle.jvmargs="-Xmx2048m -XX:+HeapDumpOnOutOfMemoryError"
+  ERROR_TRACKING_DIR: failure-reports
+
+jobs:
+  build-test-analyze:
+    name: Build, Test, Analyze, and Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+      id-token: write
+      pull-requests: write
+      
+    environment:
+      name: ${{ github.ref_name == 'main' && 'production' || github.ref_name == 'staging' && 'staging' || 'development' }}
+      
+    steps:
+      # ===== Enhanced Checkout =====
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          
+      - name: Install Security Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-secrets
+          
+          # Install git-secrets
+          git secrets --register-aws || true
+          
+          # Install Gitleaks
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks-linux-amd64 -o gitleaks
+          chmod +x gitleaks
+          sudo mv gitleaks /usr/local/bin/
+          
+      - name: Security Scan
+        id: security_scan
+        run: |
+          # Scan for secrets with git-secrets
+          git secrets --scan || (echo "CRITICAL: Secrets found in codebase!" && exit 1)
+          
+          # Scan with gitleaks
+          gitleaks detect --source . --verbose || (echo "CRITICAL: Secrets found in codebase!" && exit 1)
+          
+          # Check for large files
+          find . -type f -size +10M | grep -v '.git/' > large_files.txt
+          if [ -s large_files.txt ]; then
+            echo "WARNING: Large files found in repository:"
+            cat large_files.txt
+          fi
+          
+      - name: Collect Git Metadata
+        id: git_metadata
+        run: |
+          # Basic metadata
+          echo "GIT_AUTHOR=$(git log -1 --pretty=format:'%an <%ae>')" >> $GITHUB_ENV
+          echo "GIT_COMMIT_MSG=$(git log -1 --pretty=format:'%s')" >> $GITHUB_ENV
+          echo "GIT_COMMIT_DATE=$(git log -1 --pretty=format:'%ad' --date=iso)" >> $GITHUB_ENV
+          
+          # Extended metadata
+          echo "GIT_COMMIT_COUNT=$(git rev-list --count HEAD)" >> $GITHUB_ENV
+          echo "GIT_CONTRIBUTORS=$(git shortlog -sne --all | wc -l)" >> $GITHUB_ENV
+          echo "GIT_BRANCHES=$(git branch -r | wc -l)" >> $GITHUB_ENV
+          echo "GIT_CHANGED_FILES=$(git diff --name-only HEAD~1..HEAD 2>/dev/null | wc -l || echo 0)" >> $GITHUB_ENV
+          echo "GIT_LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo 'no-tags')" >> $GITHUB_ENV
+          
+          # Recent activity
+          echo "GIT_RECENT_COMMITS=$(git log -n 5 --pretty=format:'%h|%an|%s' --no-merges)" >> $GITHUB_ENV
+          echo "GIT_IS_MERGE_COMMIT=$(git rev-parse --verify HEAD^2 >/dev/null 2>&1 && echo 'true' || echo 'false')" >> $GITHUB_ENV
+          
+          # File change impact
+          echo "GIT_CODE_CHANGES=$(git diff --name-only HEAD~1..HEAD 2>/dev/null | grep -E '\.(java|groovy|kt|scala)$' | wc -l || echo 0)" >> $GITHUB_ENV
+          echo "GIT_CONFIG_CHANGES=$(git diff --name-only HEAD~1..HEAD 2>/dev/null | grep -E '\.(xml|properties|yaml|yml|json)$' | wc -l || echo 0)" >> $GITHUB_ENV
+          echo "GIT_DOC_CHANGES=$(git diff --name-only HEAD~1..HEAD 2>/dev/null | grep -E '\.(md|txt|doc|docx)$' | wc -l || echo 0)" >> $GITHUB_ENV
+          
+          # Create metadata directory
+          mkdir -p reports
+          
+          # Generate Git metadata JSON
+          cat > reports/git-metadata.json << EOF
+          {
+            "repository": "${{ github.repository }}",
+            "branch": "${{ github.ref_name }}",
+            "commit": "${{ github.sha }}",
+            "author": "${GIT_AUTHOR}",
+            "message": "${GIT_COMMIT_MSG}",
+            "date": "${GIT_COMMIT_DATE}",
+            "files_changed": "${GIT_CHANGED_FILES}",
+            "commit_count": "${GIT_COMMIT_COUNT}",
+            "contributors": "${GIT_CONTRIBUTORS}",
+            "branches": "${GIT_BRANCHES}",
+            "latest_tag": "${GIT_LATEST_TAG}",
+            "is_merge_commit": "${GIT_IS_MERGE_COMMIT}",
+            "code_changes": "${GIT_CODE_CHANGES}",
+            "config_changes": "${GIT_CONFIG_CHANGES}",
+            "doc_changes": "${GIT_DOC_CHANGES}"
+          }
+          EOF
+          
+      # ===== Set Variables (Similar to Jenkins stage) =====
+      - name: Set Build Variables
+        id: vars
+        run: |
+          # Set Docker image tags
+          echo "DOCKER_IMAGE_TAG=${{ github.sha }}-${{ github.run_number }}" >> $GITHUB_ENV
+          echo "DOCKER_IMAGE_VERSION=${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:${{ github.sha }}-${{ github.run_number }}" >> $GITHUB_ENV
+          echo "DOCKER_IMAGE_LATEST=${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:latest" >> $GITHUB_ENV
+          
+          # Determine deployment environment
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "DEPLOY_ENVIRONMENT=production" >> $GITHUB_ENV
+            echo "VULNERABILITY_SEVERITY=MEDIUM,HIGH,CRITICAL" >> $GITHUB_ENV
+            echo "MAX_MEMORY=8192" >> $GITHUB_ENV
+          elif [[ "${{ github.ref }}" == "refs/heads/staging" ]]; then
+            echo "DEPLOY_ENVIRONMENT=staging" >> $GITHUB_ENV
+            echo "VULNERABILITY_SEVERITY=HIGH,CRITICAL" >> $GITHUB_ENV
+            echo "MAX_MEMORY=4096" >> $GITHUB_ENV
+          else
+            echo "DEPLOY_ENVIRONMENT=development" >> $GITHUB_ENV
+            echo "VULNERABILITY_SEVERITY=HIGH,CRITICAL" >> $GITHUB_ENV
+            echo "MAX_MEMORY=4096" >> $GITHUB_ENV
+          fi
+          
+          # Detect resources
+          echo "JAVA_MAX_CPUS=$(nproc)" >> $GITHUB_ENV
+          echo "AVAILABLE_MEMORY=$(free -m | grep Mem | awk '{print int($2 * 0.8)}')" >> $GITHUB_ENV
+          
+          # Create cache key
+          echo "CACHE_KEY=$(find . -name "build.gradle" -o -name "gradle.properties" -o -name "settings.gradle" | sort | xargs cat 2>/dev/null | md5sum | cut -d " " -f1)" >> $GITHUB_ENV
+          
+          # Create error tracking directory
+          mkdir -p ${{ env.ERROR_TRACKING_DIR }}
+          
+      # ===== Audit Setup =====
+      - name: Initialize Audit Trail
+        id: audit_setup
+        run: |
+          STARTED_BY="${{ github.actor }}"
+          START_TIME=$(date -u +'%Y-%m-%dT%H:%M:%S.%3NZ')
+          
+          cat > pipeline-audit.json << EOF
+          {
+            "pipeline_id": "${{ github.run_id }}-${{ github.run_attempt }}",
+            "started_by": "${STARTED_BY}",
+            "branch": "${{ github.ref_name }}",
+            "commit": "${{ github.sha }}",
+            "start_time": "${START_TIME}",
+            "environment": "${DEPLOY_ENVIRONMENT}",
+            "git_author": "${GIT_AUTHOR}",
+            "commit_message": "${GIT_COMMIT_MSG}",
+            "commit_date": "${GIT_COMMIT_DATE}",
+            "parameters": {
+              "test_mode": ${{ inputs.test_mode || false }},
+              "skip_tests": ${{ inputs.skip_tests || false }},
+              "skip_sonar": ${{ inputs.skip_sonar || false }},
+              "allow_vulnerable_build": ${{ inputs.allow_vulnerable_build || false }}
+            }
+          }
+          EOF
+          
+      # ===== Java Setup =====
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+          
+      # ===== Dependency Audit =====
+      - name: Dependency Audit
+        id: dependency_audit
+        continue-on-error: true
+        run: |
+          # Generate dependency tree
+          ./gradlew dependencies > dependency-tree.txt
+          
+          # Check for vulnerable dependencies
+          ./gradlew dependencyCheckAnalyze || echo "DependencyCheck failed, but continuing..."
+          
+          # Check for outdated dependencies
+          ./gradlew dependencyUpdates -Drevision=release > outdated-dependencies.txt || true
+          
+          # Check for license issues
+          ./gradlew licenseReport || echo "License report generation failed, but continuing..."
+          
+          # Count vulnerabilities
+          if [ -f "build/reports/dependency-check-report.html" ]; then
+            VULN_COUNT=$(grep -c "One or more dependencies were identified with known vulnerabilities" build/reports/dependency-check-report.html || echo "0")
+            
+            if [ "$VULN_COUNT" -gt "0" ]; then
+              echo "WARNING: Vulnerabilities found in dependencies!"
+              
+              if [ "$DEPLOY_ENVIRONMENT" = "production" ] && [ "${{ inputs.allow_vulnerable_build }}" != "true" ]; then
+                echo "ERROR: Vulnerabilities found in production and override not allowed."
+                exit 1
+              fi
+            fi
+          fi
+          
+          # Create dependency summary
+          DIRECT_DEPS=$(grep -c "--- " dependency-tree.txt || echo "0")
+          TRANSITIVE_DEPS=$(grep -c "\\\\--- " dependency-tree.txt || echo "0")
+          OUTDATED_DEPS=$(grep -c "newer version" outdated-dependencies.txt || echo "0")
+          
+          cat > dependency-summary.json << EOF
+          {
+            "direct_dependencies": ${DIRECT_DEPS},
+            "transitive_dependencies": ${TRANSITIVE_DEPS},
+            "outdated_dependencies": ${OUTDATED_DEPS},
+            "analysis_date": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          }
+          EOF
+          
+      # ===== Build =====
+      - name: Build Application
+        id: build
+        run: |
+          # Validate Gradle wrapper
+          chmod +x ./gradlew
+          ./gradlew --version
+          
+          # Extract project version
+          PROJECT_VERSION=$(./gradlew properties -q | grep "version:" | awk '{print $2}')
+          if [ -z "$PROJECT_VERSION" ]; then
+            PROJECT_VERSION="1.0.0-b${{ github.run_number }}"
+          fi
+          echo "PROJECT_VERSION=${PROJECT_VERSION}" >> $GITHUB_ENV
+          
+          # Build application
+          ./gradlew clean build -x test \
+            --build-cache \
+            --parallel \
+            --max-workers=${JAVA_MAX_CPUS} \
+            -Dorg.gradle.caching=true \
+            -Dorg.gradle.configureondemand=true
+            
+          # Create build info
+          cat > build-info.json << EOF
+          {
+            "build_number": "${{ github.run_number }}",
+            "version": "${PROJECT_VERSION}",
+            "git_commit": "${{ github.sha }}",
+            "build_date": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+            "build_by": "${{ github.actor }}",
+            "java_version": "$(java -version 2>&1 | head -n 1)",
+            "gradle_version": "$(./gradlew --version | grep Gradle | head -n 1)"
+          }
+          EOF
+          
+      # ===== Tests & Coverage =====
+      - name: Run Tests and Coverage
+        id: test
+        if: ${{ !inputs.skip_tests }}
+        run: |
+          # Run tests
+          ./gradlew test jacocoTestReport \
+            --build-cache \
+            --parallel \
+            --max-workers=${JAVA_MAX_CPUS} \
+            -Dtest.parallelism=4 \
+            -Dtest.fork.count=4
+            
+          # Generate test summary
+          TEST_COUNT=$(find . -path "*/build/test-results/test/*.xml" -exec grep -c "<testcase" {} \; 2>/dev/null | awk '{sum += $1} END {print sum}' || echo "0")
+          FAILURE_COUNT=$(find . -path "*/build/test-results/test/*.xml" -exec grep -c "<failure" {} \; 2>/dev/null | awk '{sum += $1} END {print sum}' || echo "0")
+          ERROR_COUNT=$(find . -path "*/build/test-results/test/*.xml" -exec grep -c "<error" {} \; 2>/dev/null | awk '{sum += $1} END {print sum}' || echo "0")
+          SKIPPED_COUNT=$(find . -path "*/build/test-results/test/*.xml" -exec grep -c "<skipped" {} \; 2>/dev/null | awk '{sum += $1} END {print sum}' || echo "0")
+          
+          # Create test summary JSON
+          cat > test-summary.json << EOF
+          {
+            "total_tests": ${TEST_COUNT},
+            "passed_tests": $((TEST_COUNT - FAILURE_COUNT - ERROR_COUNT - SKIPPED_COUNT)),
+            "failed_tests": ${FAILURE_COUNT},
+            "error_tests": ${ERROR_COUNT},
+            "skipped_tests": ${SKIPPED_COUNT},
+            "test_date": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          }
+          EOF
+          
+      # ===== Test Result Publishing =====
+      - name: Publish Test Results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: ${{ !inputs.skip_tests && always() }}
+        with:
+          files: |
+            **/build/test-results/test/*.xml
+          check_name: Unit Test Results
+          comment_title: Test Summary
+          
+      - name: Upload Coverage to Codecov
+        if: ${{ !inputs.skip_tests }}
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./build/reports/jacoco/test/jacocoTestReport.xml
+          fail_ci_if_error: false
+          
+      # ===== SonarQube Analysis =====
+      - name: SonarQube Scan
+        if: ${{ !inputs.skip_sonar }}
+        uses: SonarSource/sonarcloud-github-action@v1.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ github.repository_owner }}
+            -Dsonar.java.source=17
+            -Dsonar.java.binaries=build/classes/java/main
+            -Dsonar.coverage.jacoco.xmlReportPaths=build/reports/jacoco/test/jacocoTestReport.xml
+            
+      # ... Continuing with Docker build, scanning, etc.
+      # The pattern continues for all remaining stages from Jenkins
+      
+      # ===== Upload Artifacts =====
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: build-artifacts-${{ github.sha }}
+          retention-days: 30
+          path: |
+            reports/
+            dependency-*.txt
+            build-info.json
+            test-summary.json
+            pipeline-audit.json
+            ${{ env.ERROR_TRACKING_DIR }}/
+            build/reports/
+            
+      # ===== Finalize Audit Trail =====
+      - name: Finalize Audit Trail
+        if: always()
+        run: |
+          # Update audit record with completion
+          jq --arg status "${{ job.status }}" \
+             --arg end_time "$(date -u +'%Y-%m-%dT%H:%M:%S.%3NZ')" \
+             --arg duration "${{ steps.main.outcome }}" \
+             '.status = $status | .end_time = $end_time | .duration_seconds = ((now - (.start_time | fromdate)) | floor)' \
+             pipeline-audit.json > temp-audit.json && mv temp-audit.json pipeline-audit.json
+             
+          # Add any failure information
+          if [ -d "${{ env.ERROR_TRACKING_DIR }}" ]; then
+            FAILURES=$(find ${{ env.ERROR_TRACKING_DIR }} -name "*.json" -exec cat {} \; | jq -s .)
+            jq --argjson failures "$FAILURES" '.failures = $failures' pipeline-audit.json > temp-audit.json && mv temp-audit.json pipeline-audit.json
+          fi
+
+      - name: Slack Notification
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,commit,author,message
+          custom_payload: |
+            {
+              "attachments": [{
+                "color": "${{ job.status == 'success' && 'good' || 'danger' }}",
+                "title": "CI Pipeline - Java App",
+                "text": "Status: *${{ job.status }}* on *${{ github.ref_name }}*",
+                "fields": [
+                  {
+                    "title": "Environment",
+                    "value": "${{ env.DEPLOY_ENVIRONMENT }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Image Tag",
+                    "value": "${{ env.DOCKER_IMAGE_TAG }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Author",
+                    "value": "${{ env.GIT_AUTHOR }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Commit Message",
+                    "value": "${{ env.GIT_COMMIT_MSG }}",
+                    "short": false
+                  }
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }} # in GitHub secrets
