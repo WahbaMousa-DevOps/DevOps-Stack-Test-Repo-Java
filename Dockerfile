@@ -1,12 +1,3 @@
-# Prod real app runtime
-# Purpose: Build and package the Java app into a lightweight runtime image.
-# Used during CI to build, then deploy to production.
-# Multi-stage:
-# Stage 1: Use JDK to compile.
-# Stage 2: Use JRE only (no compiler) → smaller, secure image.
-# Used For: Running the app in production (not for building).
-# This is your Java App Image — lightweight and deployable.
-# Build stage
 
 FROM openjdk:17-jdk-slim-buster AS builder
 WORKDIR /app
