@@ -1,3 +1,4 @@
+# Prod real app runtime
 # Purpose: Build and package the Java app into a lightweight runtime image.
 # Used during CI to build, then deploy to production.
 # Multi-stage:

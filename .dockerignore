@@ -1,0 +1,29 @@
+# Maven / Gradle build output
+target/
+build/
+.gradle/
+
+# Compiled class files and JARs
+*.class
+*.jar
+*.war
+*.ear
+
+# IDE folders
+.idea/
+.vscode/
+*.iml
+
+# Logs
+*.log
+
+# Docker files
+Dockerfile
+.dockerignore
+
+# Git
+.git
+.gitignore
+
+# Secrets or environment
+.env

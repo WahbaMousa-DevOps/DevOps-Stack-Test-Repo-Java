@@ -1,5 +1,16 @@
-.gradle/
+# Maven
+target/
+*.log
 
+# Gradle
 build/
+.gradle/
+!gradle-wrapper.jar
 
-.idea/, .vscode/
+# Common
+*.class
+*.jar
+*.war
+*.iml
+.idea/
+.env
